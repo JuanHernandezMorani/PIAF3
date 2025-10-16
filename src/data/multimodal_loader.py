@@ -1,5 +1,8 @@
-import os, json, random
-from typing import Dict, Any, Tuple, List
+import os
+import json
+import random
+from typing import Dict, Any, Tuple, List, Optional
+
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset
@@ -22,87 +25,178 @@ def add_coordconv(h, w):
     return xx[...,None], yy[...,None]  # (H,W,1)
 
 class MultimodalYoloDataset(Dataset):
-    def __init__(self, root: str, split_file: str, imgsz: int = 512,
-                 use_metalness: bool = False, use_coordconv: bool = False):
+    """Dataset multimodal para YOLO-seg con canales PBR sincronizados."""
+
+    def __init__(
+        self,
+        root: str,
+        split_file: str,
+        imgsz: int = 512,
+        use_metalness: bool = False,
+        use_coordconv: bool = False,
+        augment: bool = True,
+        seed: Optional[int] = None,
+    ):
         self.root = root
         self.imgsz = imgsz
         self.use_metalness = use_metalness
         self.use_coordconv = use_coordconv
+        self.augment = augment
+        self.rng = random.Random(seed) if seed is not None else random.Random()
 
         with open(split_file, "r", encoding="utf-8") as f:
             lines = [l.strip() for l in f.readlines() if l.strip() and not l.startswith("#")]
         self.items = [os.path.splitext(os.path.basename(p))[0] for p in lines]
 
-    def __len__(self): return len(self.items)
+    def __len__(self) -> int:
+        return len(self.items)
 
-    def _paths(self, name: str) -> Dict[str,str]:
-        base = f"data"
+    def _paths(self, name: str) -> Dict[str, str]:
+        base = "data"
         return {
             "rgb": os.path.join(self.root, f"{base}/images/{name}.png"),
-            "n":   os.path.join(self.root, f"{base}/maps/normal/{name}_n.png"),
-            "r":   os.path.join(self.root, f"{base}/maps/roughness/{name}_r.png"),
-            "s":   os.path.join(self.root, f"{base}/maps/specular/{name}_s.png"),
-            "e":   os.path.join(self.root, f"{base}/maps/emissive/{name}_e.png"),
-            "m":   os.path.join(self.root, f"{base}/maps/metalness/{name}_m.png"),
-            "meta":os.path.join(self.root, f"{base}/meta/{name}.json"),
+            "n": os.path.join(self.root, f"{base}/maps/normal/{name}_n.png"),
+            "r": os.path.join(self.root, f"{base}/maps/roughness/{name}_r.png"),
+            "s": os.path.join(self.root, f"{base}/maps/specular/{name}_s.png"),
+            "e": os.path.join(self.root, f"{base}/maps/emissive/{name}_e.png"),
+            "m": os.path.join(self.root, f"{base}/maps/metalness/{name}_m.png"),
+            "meta": os.path.join(self.root, f"{base}/meta/{name}.json"),
             "ann": os.path.join(self.root, f"{base}/ann/{name}.txt"),
         }
 
     def _context_vec(self, meta_path: str) -> np.ndarray:
         try:
-            meta = json.load(open(meta_path, "r", encoding="utf-8"))
+            with open(meta_path, "r", encoding="utf-8") as fh:
+                meta = json.load(fh)
         except Exception:
-            meta = {"lum":0.5,"sat":0.5,"contrast":0.5,"dominant_colors":[]}
-        vec = [
-            float(meta.get("lum", 0.5)),
-            float(meta.get("sat", 0.5)),
-            float(meta.get("contrast", 0.5)),
-        ]
+            meta = {}
+
+        lum = float(meta.get("luminance_lab", meta.get("lum", 50.0)))
+        sat = float(meta.get("saturation", meta.get("sat", 0.5)))
+        contrast = float(meta.get("contrast", 0.5))
+
+        def _to_unit(value: float, low: float, high: float) -> float:
+            if high == low:
+                return 0.0
+            scaled = (value - low) / (high - low)
+            return float(np.clip(scaled, 0.0, 1.0))
+
+        lum_unit = _to_unit(lum, 0.0, 100.0)
+        sat_unit = _to_unit(sat, 0.0, 1.0)
+        contrast_unit = _to_unit(contrast, 0.0, 100.0)
+
+        vec = [lum_unit, sat_unit, contrast_unit]
+
         cols = meta.get("dominant_colors", [])[:5]
-        flat = []
+        flat: List[float] = []
         for c in cols:
-            if isinstance(c, list) and len(c)==3:
-                flat.extend([v/255.0 for v in c])
+            if isinstance(c, list) and len(c) == 3:
+                flat.extend([float(v) / 255.0 for v in c])
         while len(flat) < 15:
             flat.append(0.0)
         vec.extend(flat)
-        return np.array(vec, dtype=np.float32)
 
-    def _load_modalities(self, paths: Dict[str,str]) -> np.ndarray:
-        rgb = load_img(paths["rgb"], "RGB").astype(np.float32)/255.0
-        nrm = load_img(paths["n"], "RGB").astype(np.float32)/255.0
-        rgh = load_img(paths["r"], "L").astype(np.float32)/255.0[...,None]
-        spc = load_img(paths["s"], "L").astype(np.float32)/255.0[...,None]
-        ems = load_img(paths["e"], "L").astype(np.float32)/255.0[...,None]
+        arr = np.array(vec, dtype=np.float32)
+        arr = arr * 2.0 - 1.0
+        return arr
+
+    def _load_modalities(self, paths: Dict[str, str]) -> np.ndarray:
+        rgb = load_img(paths["rgb"], "RGB").astype(np.float32) / 255.0
+        nrm = load_img(paths["n"], "RGB").astype(np.float32) / 255.0
+        rgh = load_img(paths["r"], "L").astype(np.float32) / 255.0[..., None]
+        spc = load_img(paths["s"], "L").astype(np.float32) / 255.0[..., None]
+        ems = load_img(paths["e"], "L").astype(np.float32) / 255.0[..., None]
         chans = [rgb, nrm, rgh, spc, ems]
         if self.use_metalness and os.path.exists(paths["m"]):
-            mtl = load_img(paths["m"], "L").astype(np.float32)/255.0[...,None]
+            mtl = load_img(paths["m"], "L").astype(np.float32) / 255.0[..., None]
             chans.append(mtl)
         h, w = rgb.shape[:2]
         if self.use_coordconv:
             xx, yy = add_coordconv(h, w)
             chans.extend([xx, yy])
-        x = np.concatenate(chans, axis=-1)  # (H,W,C)
+        x = np.concatenate(chans, axis=-1)
         return x
 
-    def _resize(self, arr: np.ndarray) -> np.ndarray:
-        pil = Image.fromarray((arr*255.0).clip(0,255).astype(np.uint8))
-        pil = pil.resize((self.imgsz, self.imgsz), Image.NEAREST)
-        out = np.array(pil).astype(np.float32)/255.0
-        return out
+    def _load_polygons(self, ann_path: str, width: int, height: int) -> Tuple[List[np.ndarray], List[int]]:
+        polys: List[np.ndarray] = []
+        classes: List[int] = []
+        if not os.path.exists(ann_path):
+            return polys, classes
+
+        with open(ann_path, "r", encoding="utf-8") as fh:
+            for raw in fh.readlines():
+                stripped = raw.strip()
+                if not stripped:
+                    continue
+                parts = stripped.split()
+                if len(parts) < 7 or (len(parts) - 1) % 2 != 0:
+                    continue
+                try:
+                    class_id = int(float(parts[0]))
+                except ValueError:
+                    continue
+                coords = np.array([float(p) for p in parts[1:]], dtype=np.float32)
+                pts = coords.reshape(-1, 2)
+                pts[:, 0] *= float(width)
+                pts[:, 1] *= float(height)
+                polys.append(pts)
+                classes.append(class_id)
+        return polys, classes
+
+    def _apply_augmentations(self, arr: np.ndarray, polygons: List[np.ndarray]) -> Tuple[np.ndarray, List[np.ndarray]]:
+        h, w = arr.shape[0], arr.shape[1]
+        polys = [poly.copy() for poly in polygons]
+
+        if self.augment and self.rng.random() < 0.5:
+            arr = arr[:, ::-1, :]
+            for poly in polys:
+                poly[:, 0] = float(w) - poly[:, 0]
+
+        if self.augment and self.rng.random() < 0.5:
+            arr = arr[::-1, :, :]
+            for poly in polys:
+                poly[:, 1] = float(h) - poly[:, 1]
+
+        return arr, polys
+
+    def _resize(self, tensor: torch.Tensor) -> torch.Tensor:
+        tensor = tensor.unsqueeze(0)
+        resized = F.interpolate(tensor, size=(self.imgsz, self.imgsz), mode="bilinear", align_corners=False)
+        return resized.squeeze(0)
 
     def __getitem__(self, idx: int):
         name = self.items[idx]
         paths = self._paths(name)
-        x = self._load_modalities(paths)
-        x = self._resize(x)
+        x_np = self._load_modalities(paths)
+        height, width = x_np.shape[0], x_np.shape[1]
 
-        ctx = self._context_vec(paths["meta"])
-        targets = {"name": name, "polygons": [], "classes": []}  # placeholder
+        polys_px, classes = self._load_polygons(paths["ann"], width, height)
+        x_np, polys_px = self._apply_augmentations(x_np, polys_px)
 
-        x = torch.from_numpy(x.transpose(2,0,1))  # (C,H,W)
-        ctx = torch.from_numpy(ctx)               # (D,)
-        return x, ctx, targets
+        x_tensor = torch.from_numpy(x_np.transpose(2, 0, 1)).float()
+        x_tensor = self._resize(x_tensor)
+
+        scale_x = self.imgsz / float(width)
+        scale_y = self.imgsz / float(height)
+        scaled_polys: List[torch.Tensor] = []
+        for poly in polys_px:
+            scaled = poly.copy()
+            scaled[:, 0] *= scale_x
+            scaled[:, 1] *= scale_y
+            norm = np.clip(scaled / float(self.imgsz), 0.0, 1.0)
+            scaled_polys.append(torch.from_numpy(norm.astype(np.float32)))
+
+        ctx = torch.from_numpy(self._context_vec(paths["meta"]))
+
+        targets = {
+            "name": name,
+            "classes": torch.as_tensor(classes, dtype=torch.long),
+            "segments": scaled_polys,
+            "orig_size": torch.tensor([height, width], dtype=torch.float32),
+            "img_size": torch.tensor([self.imgsz, self.imgsz], dtype=torch.float32),
+        }
+
+        return x_tensor, ctx, targets
 
 def collate_fn(batch):
     xs, ctxs, tgts = zip(*batch)
