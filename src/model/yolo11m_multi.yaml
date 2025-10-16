@@ -1,0 +1,22 @@
+# YOLOv11-seg (multi-modal) — Skeleton YAML
+# Ajusta anchors/Depth/Width según tu variante (n/s/m/l/x). Aquí dejamos placeholders.
+
+nc: 18
+names:
+  [eyes, wings, body, extremities, fangs, claws, extra, head, mouth, heart,
+   cracks, cristal, flower, zombie_zone, armor, sky, stars, aletas]
+
+# Entrada multi-canal (editar desde el código): in_channels = 3 + 3 + 1 + 1 + 1 [+1 metalness] [+2 coordconv]
+# backbone/head reales deben ser importados desde el código Python parcheado.
+backbone:
+  - type: Conv
+    args: [in_channels, 64, 3, 2]
+  - type: C2f
+    args: [64, 128, 3]
+  - type: C2f
+    args: [128, 256, 6]   # ...
+  # ... (placeholder)
+
+head:
+  - type: SegHead
+    args: [256, 18]       # placeholder

@@ -1,0 +1,1 @@
+# Rutas relativas de train (una por línea) ej: images/foo.png
