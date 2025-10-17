@@ -105,6 +105,52 @@ def test_dataset_channels_context_and_targets(tmp_path):
     )
     assert torch.allclose(seg, expected, atol=1e-5)
 
+    assert set(target["pbr"].keys()) == {"normals", "rough", "spec", "emiss"}
+    for key, tensor in target["pbr"].items():
+        assert tensor.shape[-2:] == (64, 64)
+        assert tensor.dim() == 3
+
+
+def test_pbr_dropout_applied(tmp_path):
+    root = Path(tmp_path)
+    _build_basic_dataset(root, ["foo"], pattern="grad")
+
+    from PIL import Image
+
+    normal = np.full((64, 64, 3), 255, dtype=np.uint8)
+    roughness = np.full((64, 64), 128, dtype=np.uint8)
+    specular = np.full((64, 64), 64, dtype=np.uint8)
+    emissive = np.full((64, 64), 32, dtype=np.uint8)
+    Image.fromarray(normal).save(root / "data/maps/normal" / "foo_n.png")
+    Image.fromarray(roughness).save(root / "data/maps/roughness" / "foo_r.png")
+    Image.fromarray(specular).save(root / "data/maps/specular" / "foo_s.png")
+    Image.fromarray(emissive).save(root / "data/maps/emissive" / "foo_e.png")
+
+    meta = {"luminance_lab": 50.0, "saturation": 0.5, "contrast": 10.0, "dominant_colors": []}
+    _write_meta(root, "foo", meta)
+    ann_line = "1 0.25 0.25 0.75 0.25 0.75 0.75"
+    _write_ann(root, "foo", ann_line)
+    _write_split(root, ["foo"])
+
+    ds = MultimodalYoloDataset(
+        str(root),
+        str(root / "splits/train.txt"),
+        imgsz=32,
+        augment=True,
+        seed=0,
+        pbr_dropout_prob=1.0,
+    )
+
+    x, _, target = ds[0]
+
+    # RGB channels remain untouched
+    assert torch.any(x[:3] != 0.0)
+
+    # All PBR channels are zeroed with dropout probability 1.0
+    assert torch.allclose(x[3:], torch.zeros_like(x[3:]))
+    for key, tensor in target["pbr"].items():
+        assert torch.any(tensor != 0.0), f"{key} target should remain intact"
+
 
 def test_horizontal_flip_sync(tmp_path):
     root = Path(tmp_path)
