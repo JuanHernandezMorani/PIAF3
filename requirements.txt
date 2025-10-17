@@ -1,0 +1,15 @@
+torch>=2.2,<2.4
+torchvision>=0.17,<0.19
+ultralytics>=8.2.0
+numpy>=1.26
+opencv-python>=4.9
+pyyaml>=6.0
+tqdm>=4.66
+albumentations>=1.4
+scipy>=1.11
+pillow>=10.0
+tensorboard>=2.14
+matplotlib>=3.7
+einops>=0.7
+safetensors>=0.4
+# Versions may be adjusted to match the target CUDA runtime (11.x or 12.x).
