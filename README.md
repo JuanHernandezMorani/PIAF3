@@ -1,118 +1,143 @@
-# PIAF3 — Herramientas de Dataset
+# PIAF3 — Entrenamiento multimodal YOLOv11
 
-Este repositorio contiene un esqueleto para entrenar un modelo YOLOv11 multimodal
-(RGB + PBR + contexto). Las utilidades en `tools/` facilitan la auditoría y el
-procesamiento de los assets para garantizar su consistencia antes de
-entrenamiento.
+Este repositorio contiene un esqueleto completo para entrenar un modelo YOLOv11
+(segmentación) condicionado por entradas RGB, mapas PBR y contexto textual.
+Incluye scripts de entrenamiento, validación, exportación y herramientas para la
+sanidad del dataset.
 
-## Entrenamiento multimodal
-
-### Requisitos
+## Requisitos rápidos
 
 - Ubuntu 20.04 o superior.
-- NVIDIA CUDA 12.x (opcional pero recomendado para acelerar el entrenamiento).
-- Python 3.10+ con PyTorch y torchvision compatibles con la versión de CUDA instalada.
+- Python 3.10+.
+- PyTorch 2.2–2.3 con CUDA 11/12 (opcional, pero recomendado para GPU).
 
-Instala las dependencias necesarias mediante:
+Instalación mínima:
 
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-### Ejecución
+## Configura tu dataset
 
-```bash
-python -m src.train \
-  --config configs/train_multi.yaml \
-  --pretrained yolo.pt \
-  --project runs/multi \
-  --name exp1
+Declara la estructura en `configs/data.yaml`:
+
+```yaml
+# rutas
+path: /ABSOLUTE/PATH/TO/DATASET
+train: images/train
+val: images/val
+
+# clases
+nc: 3
+names: [class_0, class_1, class_2]
+
+# PBR y texto
+pbr:
+  enabled: true
+  suffix:
+    normal: "_normal"
+    roughness: "_rough"
+    metallic: "_metal"
+    ao: "_ao"
+    height: "_height"
+    curvature: "_curv"
+  order: ["normal", "roughness", "metallic", "ao", "height", "curvature"]
+
+text:
+  enabled: true
+  root: texts
 ```
 
-### Estructura del dataset
+Estructura esperada:
 
 ```
 dataset/
-├── data.yaml          # describe `path`, `train` y `val`
 ├── images/
-│   ├── train/
-│   │   └── *.png | *.jpg
-│   └── val/
-│       └── *.png | *.jpg
+│   ├── train/foo.png
+│   └── val/bar.png
 ├── labels/
-│   ├── train/
-│   │   └── *.txt
-│   └── val/
-│       └── *.txt
-├── texts/             # opcional, descripciones por asset
-│   └── *.txt
-└── PBR maps junto a cada imagen con sufijos:
-    *_normal.png, *_roughness.png, *_ao.png,
-    *_height.png, *_metallic.png
+│   ├── train/foo.txt       # YOLO-seg (cls x y w h [polígonos])
+│   └── val/bar.txt
+├── texts/
+│   └── train/foo.txt       # opcional, string libre ("", si no hay contexto)
+└── images/train/
+    ├── foo_normal.png
+    ├── foo_rough.png
+    ├── foo_metal.png
+    ├── foo_ao.png
+    ├── foo_height.png
+    └── foo_curv.png
 ```
 
-Los mapas PBR deben estar normalizados en el rango `[0, 1]`. Las normales en espacio tangente aceptan valores en `[-1, 1]`, pero el *loader* los remapeará automáticamente a `[0, 1]` si detecta valores fuera del rango esperado.
+Los mapas PBR que falten se rellenan con ceros. Si un PNG trae canal alfa se
+mantiene internamente y la red recibe únicamente RGB + PBR.
 
-Los textos pueden residir junto a la imagen (`image.png` + `image.txt`) o en `texts/` con el mismo nombre base.
+## Entrena
 
-## Validación de dataset (`tools/validate_dataset.py`)
-
-La validación inspecciona cada elemento del *split* y verifica:
-
-- Presencia de todos los archivos esperados (RGB, mapas PBR, `meta/*.json`, `ann/*.txt`).
-- Consistencia dimensional entre RGB y mapas PBR.
-- Integridad básica de las anotaciones YOLO-seg (IDs válidos, puntos suficientes, coordenadas normalizadas).
-- Existencia de claves críticas en los metadatos (por defecto: `dominant_colors`, `luminance_lab`, `saturation`, `contrast`).
-- Conteo agregado de polígonos por clase.
-
-Uso básico:
+Ajusta `configs/train_multi.yaml` y ejecuta:
 
 ```bash
-python tools/validate_dataset.py \
-    --root /ruta/al/dataset \
-    --split splits/train.txt \
-    --report-json reports/train_report.json
+python -m src.train \
+  --cfg configs/train_multi.yaml \
+  --data configs/data.yaml \
+  --pretrained /ruta/a/yolo.pt \
+  --epochs 100 --batch 16 --imgsz 640 \
+  --pbr --text --project runs/multi --name exp
 ```
 
-Argumentos relevantes:
+Argumentos destacados:
 
-- `--require-metalness`: obliga a que el mapa `metalness` exista para cada asset.
-- `--report-json`: guarda un reporte estructurado para su posterior análisis.
-- `--meta-required`: lista opcional de claves que deben aparecer en `meta/{name}.json`.
+- `--pbr` / `--text`: habilita explícitamente cada modalidad.
+- `--resume runs/multi/exp/last.pt`: reanuda entrenamiento (scheduler + scaler incluidos).
+- `--device cuda:0` o `cpu`.
 
-## Estadísticas visuales (`tools/scan_stats.py`)
+El script registra las shapes de entrada, estadísticas de boxes/masks y guarda
+los checkpoints en `runs/multi/<name>/` (`last.pt`, `best.pt`, `ema.pt`).
 
-Genera estadísticas de color y luminancia para cada RGB del split y las fusiona
-en `data/meta/{name}.json`. Calcula:
-
-- Luminancia promedio en espacio Lab.
-- Saturación media en espacio HSV.
-- Contraste (desviación estándar del canal L*).
-- Colores dominantes vía KMeans (`dominant_colors` en RGB y `dominant_hex` en formato hexadecimal).
-- Altura y anchura del asset.
-
-Ejemplo de ejecución en modo escritura:
+## Valida
 
 ```bash
-python tools/scan_stats.py \
-    --root /ruta/al/dataset \
-    --split splits/train.txt \
-    --k 4
+python tools/validate.py \
+  --cfg configs/train_multi.yaml \
+  --data configs/data.yaml \
+  --weights runs/multi/exp/last.pt \
+  --output runs/multi/exp/metrics_val.json
 ```
 
-Argumentos útiles:
+Se reportan mAP50 y mAP50-95 por clase. Si las modalidades PBR/TXT están
+activadas se imprime un bloque de ablations:
 
-- `--dry-run`: muestra el JSON resultante sin modificar archivos.
-- `--only nombre1 nombre2`: limita el procesamiento a un subconjunto.
-- `--k`: número de clusters para KMeans (requiere `scikit-learn`).
+- `rgb_only`
+- `rgb_pbr`
+- `rgb_text`
+- `rgb_pbr_text`
 
-## Flujo recomendado
+## Exporta
 
-1. Ejecuta `scan_stats.py --dry-run` para comprobar las estadísticas y,
-   posteriormente, ejecútalo sin `--dry-run` para persistirlas en `meta/`.
-2. Corre `validate_dataset.py` para confirmar que los assets y metadatos están
-   completos antes de iniciar entrenamiento o exportar el dataset.
-3. Añade los reportes generados a tu pipeline de CI/CD o documentación.
+```bash
+python tools/export.py \
+  --cfg configs/train_multi.yaml \
+  --data configs/data.yaml \
+  --weights runs/multi/exp/best.pt \
+  --out exports/yolo-multi.pt \
+  --onnx exports/yolo-multi.onnx
+```
 
-Ambas herramientas están pensadas para trabajar con splits en formato texto
-(`splits/*.txt`) con rutas relativas como `images/example.png`.
+`--onnx` es opcional y genera un grafo con entradas dinámicas para RGB, PBR y
+texto.
+
+## Herramientas de dataset
+
+Antes de entrenar, audita el dataset con:
+
+```bash
+python tools/validate_dataset.py --root /ruta/dataset --split splits/train.txt
+python tools/scan_stats.py --root /ruta/dataset --split splits/train.txt --k 4
+```
+
+`validate_dataset.py` comprueba existencia y consistencia de RGB/PBR/labels,
+segmentaciones y metadatos. `scan_stats.py` extrae estadísticas de color y
+luminancia (KMeans opcional) y puede integrarse en tu pipeline de CI/CD.

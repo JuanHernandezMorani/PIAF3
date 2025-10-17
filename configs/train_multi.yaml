@@ -1,24 +1,10 @@
-data:
-  train: data/train.yaml
-  val: data/val.yaml
-  imgsz: 640
-  batch: 16
-  workers: 8
-  mosaic: true
-  mosaic_prob: 0.5
-  hsv_jitter: 0.05
-  block_mix_prob: 0.2
+# Default training recipe for YOLOv11 multimodal (RGB + PBR + texto)
+
+model:
+  cfg: src/model/yolo11m_multi.yaml
 
 context:
   text_dim: 256
-  pbr_channels:
-    - normal_x
-    - normal_y
-    - normal_z
-    - rough
-    - ao
-    - height
-    - metallic
   adapter_dim: 256
   hidden_dim: 256
   dropout: 0.0
@@ -43,35 +29,52 @@ loss:
   aux_warmup_iters: 1000
   pbr_weights:
     normal: 1.0
-    rough: 0.5
+    roughness: 0.5
+    metallic: 0.25
     ao: 0.25
     height: 0.25
-    metallic: 0.25
+    curvature: 0.25
   use_ssim: false
+
+optimizer:
+  lr: 0.0002
+  weight_decay: 0.05
+  betas: [0.9, 0.999]
+
+scheduler:
+  warmup_steps: 1000
+  total_steps: null  # se calcula automáticamente
 
 train:
   epochs: 50
   freeze_epochs: 8
-  lr: 0.0002
-  weight_decay: 0.05
-  warmup_steps: 1000
-  ema: true
-  val_interval: 1
-  amp: true
   grad_accum: 1
   clip_grad: 0.0
+  amp: true
+  val_interval: 1
   use_text: true
   use_pbr: true
   val_conf: 0.25
   val_iou: 0.7
   val_max_det: 300
   val_agnostic: false
-  ablations: {}
 
-save:
+logging:
   project: runs/multi
   name: exp
   keep_last: 5
+
+data:
+  yaml: configs/data.yaml
+  imgsz: 640
+  batch: 16
+  workers: 8
+  shuffle: true
+  augment:
+    mosaic: true
+    mosaic_prob: 0.5
+    hsv_jitter: 0.05
+    block_mix_prob: 0.2
 
 seed: 42
 deterministic: false

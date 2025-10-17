@@ -1,0 +1,45 @@
+# Multimodal YOLO dataset specification
+# Update these values with the real dataset paths and class metadata before training.
+
+# rutas
+path: /ABSOLUTE/PATH/TO/DATASET
+train: images/train
+val: images/val
+test: images/test  # opcional
+
+# clases
+nc: 3  # <num_classes>
+names: [class_0, class_1, class_2]  # completar con placeholders
+
+# MULTIMODAL
+pbr:
+  enabled: true
+  # sufijos de archivo por cada mapa; si falta alguno, loader debe rellenar canal con ceros
+  suffix:
+    albedo: "_albedo"
+    normal: "_normal"
+    roughness: "_rough"
+    metallic: "_metal"
+    ao: "_ao"
+    height: "_height"
+    curvature: "_curv"
+  # qué mapas se cargan y en qué orden se concatenan al backbone
+  order: ["normal", "roughness", "metallic", "ao", "height", "curvature"]
+
+text:
+  enabled: true
+  # nombre de archivo paralelo al .jpg/.png
+  # ejemplo: images/train/xxx.png -> texts/train/xxx.txt
+  # si no existe, el loader devuelve "" (string vacío)
+  root: texts
+
+formats:
+  images: [".png", ".jpg", ".jpeg"]
+  labels: [".txt"]  # YOLO format
+  masks_ok: true    # si hay segmentación
+
+notes: |
+  Documentar que para cada imagen base `foo.png` se buscarán:
+  - etiqueta: labels/.../foo.txt
+  - pbr: en el mismo directorio que la imagen, con sufijos declarados
+  - texto: texts/.../foo.txt (opcional)

@@ -1,211 +1,173 @@
-"""Inference helpers for the multimodal YOLOv11 skeleton."""
+"""Inference utilities for the multimodal YOLOv11 model."""
 
 from __future__ import annotations
 
+import argparse
 import json
-import os
-from dataclasses import dataclass
-from typing import Any, Dict, List, Mapping, Optional
+from pathlib import Path
+from typing import Any, Dict, List
 
-import numpy as np
 import torch
-import torch.nn.functional as F
+import yaml
+from tqdm.auto import tqdm
 
-from .data.multimodal_loader import add_coordconv, load_img
+from src.data.multimodal_loader import AugmentationConfig, MultiModalYOLODataset, multimodal_collate
+from src.model.build import build_yolo11_multi
+from src.train_utils.pbr import expand_pbr_channels
+from src.train_utils.text import SimpleTextEncoder
 
-
-def _infer_device(device_like: Optional[str | torch.device]) -> torch.device:
-    """Resolve a device string/handle to a :class:`torch.device`."""
-
-    if device_like is None:
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if isinstance(device_like, torch.device):
-        return device_like
-    return torch.device(device_like)
-
-
-@dataclass
-class _PredictorConfig:
-    """Typed view over the configuration dictionary."""
-
-    imgsz: int = 512
-    use_metalness: bool = False
-    use_coordconv: bool = False
-    mask_threshold: float = 0.5
-    score_threshold: float = 0.3
-    device: Optional[str | torch.device] = None
-    projector: Optional[torch.nn.Module] = None
+try:  # pragma: no cover - optional at test time
+    from ultralytics.utils import ops
+except Exception:  # pragma: no cover
+    ops = None
 
 
-class MultimodalPredictor:
-    """Utility wrapper that mirrors the dataset preprocessing for inference."""
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Multimodal YOLOv11 inference")
+    parser.add_argument("--weights", type=Path, required=True, help="Checkpoint a evaluar")
+    parser.add_argument("--cfg", type=Path, default=Path("configs/train_multi.yaml"), help="YAML de configuración del modelo")
+    parser.add_argument("--data", type=Path, default=Path("configs/data.yaml"), help="YAML del dataset")
+    parser.add_argument("--split", type=str, default="val", choices=["train", "val", "test"], help="Split a evaluar")
+    parser.add_argument("--imgsz", type=int, default=640, help="Tamaño de entrada")
+    parser.add_argument("--batch", type=int, default=1, help="Batch size de inferencia")
+    parser.add_argument("--device", type=str, default=None, help="Dispositivo CUDA o cpu")
+    parser.add_argument("--conf", type=float, default=0.25, help="Umbral de confianza")
+    parser.add_argument("--iou", type=float, default=0.7, help="Umbral IoU para NMS")
+    parser.add_argument("--pbr", dest="pbr", action="store_true", help="Forzar uso de PBR")
+    parser.add_argument("--text", dest="text", action="store_true", help="Forzar uso de texto")
+    parser.add_argument("--output", type=Path, default=Path("runs/multi/infer"), help="Directorio de resultados")
+    parser.set_defaults(pbr=None, text=None)
+    return parser.parse_args()
 
-    def __init__(self, model: torch.nn.Module, cfg: Optional[Mapping[str, Any]] = None):
-        self.cfg = _PredictorConfig(**(cfg or {}))
-        self.device = _infer_device(self.cfg.device)
-        self.model = model.to(self.device).eval()
 
-        self.projector: Optional[torch.nn.Module]
-        self.projector = self.cfg.projector
-        if self.projector is not None:
-            self.projector = self.projector.to(self.device).eval()
+def load_yaml(path: Path) -> Dict[str, Any]:
+    with path.open("r", encoding="utf-8") as handle:
+        data = yaml.safe_load(handle) or {}
+    if not isinstance(data, dict):
+        raise TypeError(f"El archivo YAML {path} debe contener un mapping")
+    return data
 
-    # ------------------------------------------------------------------
-    # Loading helpers
-    def _paths(self, root: str, name: str) -> Dict[str, str]:
-        base = os.path.join(root, "data")
-        return {
-            "rgb": os.path.join(base, "images", f"{name}.png"),
-            "n": os.path.join(base, "maps", "normal", f"{name}_n.png"),
-            "r": os.path.join(base, "maps", "roughness", f"{name}_r.png"),
-            "s": os.path.join(base, "maps", "specular", f"{name}_s.png"),
-            "e": os.path.join(base, "maps", "emissive", f"{name}_e.png"),
-            "m": os.path.join(base, "maps", "metalness", f"{name}_m.png"),
-            "meta": os.path.join(base, "meta", f"{name}.json"),
-        }
 
-    def _load_modalities(self, paths: Mapping[str, str]) -> np.ndarray:
-        rgb = load_img(paths["rgb"], "RGB").astype(np.float32) / 255.0
-        nrm = load_img(paths["n"], "RGB").astype(np.float32) / 255.0
-        rough = load_img(paths["r"], "L").astype(np.float32) / 255.0
-        spec = load_img(paths["s"], "L").astype(np.float32) / 255.0
-        emiss = load_img(paths["e"], "L").astype(np.float32) / 255.0
-        rough = rough[..., None]
-        spec = spec[..., None]
-        emiss = emiss[..., None]
+def build_dataset(args: argparse.Namespace, cfg: Dict[str, Any]) -> MultiModalYOLODataset:
+    train_cfg = cfg.get("train", {})
+    use_text = bool(train_cfg.get("use_text", True)) if args.text is None else bool(args.text)
+    use_pbr = bool(train_cfg.get("use_pbr", True)) if args.pbr is None else bool(args.pbr)
+    augment = AugmentationConfig(mosaic=False, hsv_jitter=0.0, block_mix_prob=0.0)
+    dataset = MultiModalYOLODataset(
+        data_cfg=args.data,
+        split=args.split,
+        imgsz=args.imgsz,
+        augmentation=augment,
+        seed=cfg.get("seed"),
+        use_text=use_text,
+        use_pbr=use_pbr,
+    )
+    return dataset
 
-        chans: List[np.ndarray] = [rgb, nrm, rough, spec, emiss]
 
-        if self.cfg.use_metalness and os.path.exists(paths["m"]):
-            metal = load_img(paths["m"], "L").astype(np.float32) / 255.0
-            metal = metal[..., None]
-            chans.append(metal)
+def load_model(cfg: Dict[str, Any], weights: Path, device: torch.device) -> torch.nn.Module:
+    model_cfg = dict(cfg)
+    model_cfg["pretrained"] = None
+    model = build_yolo11_multi(model_cfg).to(device)
+    checkpoint = torch.load(weights, map_location=device)
+    if isinstance(checkpoint, dict) and "model" in checkpoint:
+        model.load_state_dict(checkpoint["model"], strict=False)
+    else:
+        model.load_state_dict(checkpoint, strict=False)
+    model.eval()
+    return model
 
-        h, w = rgb.shape[:2]
-        if self.cfg.use_coordconv:
-            xx, yy = add_coordconv(h, w)
-            chans.extend([xx, yy])
 
-        stacked = np.concatenate(chans, axis=-1)
-        return stacked
+def run_inference() -> None:
+    args = parse_args()
+    cfg = load_yaml(args.cfg)
+    cfg = dict(cfg)
+    cfg.setdefault("data", {})["yaml"] = str(args.data)
 
-    def _load_context(self, meta_path: str) -> np.ndarray:
-        try:
-            with open(meta_path, "r", encoding="utf-8") as fh:
-                meta = json.load(fh)
-        except Exception:
-            meta = {}
+    dataset = build_dataset(args, cfg)
+    context_cfg = cfg.setdefault("context", {})
+    if dataset.use_pbr and dataset.spec.pbr.order:
+        context_cfg["pbr_channels"] = expand_pbr_channels(dataset.spec.pbr.order)
+    elif not dataset.use_pbr:
+        context_cfg["pbr_channels"] = []
 
-        lum = float(meta.get("luminance_lab", meta.get("lum", 50.0)))
-        sat = float(meta.get("saturation", meta.get("sat", 0.5)))
-        contrast = float(meta.get("contrast", 0.5))
+    device = torch.device(args.device) if args.device else torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    model = load_model(cfg, args.weights, device)
 
-        def _to_unit(value: float, low: float, high: float) -> float:
-            if high == low:
-                return 0.0
-            scaled = (value - low) / (high - low)
-            return float(np.clip(scaled, 0.0, 1.0))
+    text_dim = int(context_cfg.get("text_dim", 0))
+    text_encoder = SimpleTextEncoder(text_dim, seed=cfg.get("seed", 0))
 
-        lum_unit = _to_unit(lum, 0.0, 100.0)
-        sat_unit = _to_unit(sat, 0.0, 1.0)
-        contrast_unit = _to_unit(contrast, 0.0, 100.0)
+    loader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=args.batch,
+        shuffle=False,
+        num_workers=0,
+        collate_fn=multimodal_collate,
+    )
 
-        vec = [lum_unit, sat_unit, contrast_unit]
+    if ops is None:  # pragma: no cover
+        raise ImportError("Ultralytics no está instalado: requerido para NMS")
 
-        colors = meta.get("dominant_colors", [])[:5]
-        flattened: List[float] = []
-        for color in colors:
-            if isinstance(color, list) and len(color) == 3:
-                flattened.extend([float(c) / 255.0 for c in color])
-        while len(flattened) < 15:
-            flattened.append(0.0)
-        vec.extend(flattened)
+    args.output.mkdir(parents=True, exist_ok=True)
 
-        arr = np.asarray(vec, dtype=np.float32)
-        arr = arr * 2.0 - 1.0
-        return arr
+    for batch in tqdm(loader, desc="Inferencia"):
+        images = batch["img"].to(device)
+        pbr_tensor = batch.get("pbr")
+        if isinstance(pbr_tensor, torch.Tensor) and dataset.use_pbr:
+            pbr = pbr_tensor.to(device)
+        else:
+            pbr = None
+        text_inputs = batch.get("context_txt", [])
+        if dataset.use_text and text_dim > 0:
+            text_tensor = text_encoder.batch(text_inputs).to(device)
+        else:
+            text_tensor = None
 
-    # ------------------------------------------------------------------
-    # Tensor helpers
-    def _to_tensor(self, np_arr: np.ndarray) -> torch.Tensor:
-        tensor = torch.from_numpy(np_arr.transpose(2, 0, 1)).float()
-        tensor = tensor.unsqueeze(0)
-        tensor = F.interpolate(
-            tensor,
-            size=(self.cfg.imgsz, self.cfg.imgsz),
-            mode="bilinear",
-            align_corners=False,
-        )
-        return tensor.squeeze(0)
+        with torch.no_grad():
+            outputs = model(images, pbr=pbr, text=text_tensor)
+        predictions = outputs.get("pred")
+        proto = predictions[1] if isinstance(predictions, (list, tuple)) else None
+        logits = predictions[0] if isinstance(predictions, (list, tuple)) else predictions
+        dets = ops.non_max_suppression(logits, args.conf, args.iou, multi_label=True, agnostic=False)
 
-    # ------------------------------------------------------------------
-    @torch.no_grad()
-    def predict(self, root: str, name: str) -> Dict[str, Any]:
-        """Run inference on a single sample."""
+        for sample_idx, det in enumerate(dets):
+            meta = batch["meta"][sample_idx]
+            orig_h, orig_w = meta.get("orig_size", (args.imgsz, args.imgsz))
+            boxes: List[Dict[str, Any]] = []
+            masks: List[List[List[float]]] = []
 
-        paths = self._paths(root, name)
-        arr = self._load_modalities(paths)
-        orig_h, orig_w = arr.shape[0], arr.shape[1]
+            if det is not None and det.numel():
+                det_cpu = det.to("cpu")
+                xyxy = det_cpu[:, :4]
+                conf = det_cpu[:, 4].tolist()
+                cls = det_cpu[:, 5].tolist()
+                scale_w = orig_w / images.shape[3]
+                scale_h = orig_h / images.shape[2]
+                for box_tensor, score, cls_idx in zip(xyxy, conf, cls):
+                    x0, y0, x1, y1 = box_tensor.tolist()
+                    boxes.append(
+                        {
+                            "xyxy": [x0 * scale_w, y0 * scale_h, x1 * scale_w, y1 * scale_h],
+                            "confidence": score,
+                            "class_id": int(cls_idx),
+                        }
+                    )
+                if proto is not None and det_cpu.shape[1] > 6:
+                    proto_sample = proto[sample_idx]
+                    mask_coeffs = det_cpu[:, 6:]
+                    masks_tensor = ops.process_mask(proto_sample, mask_coeffs, xyxy, shape=(orig_h, orig_w))
+                    for mask in masks_tensor:
+                        contour: List[List[float]] = []
+                        ys, xs = torch.nonzero(mask > 0.5, as_tuple=True)
+                        contour = [[float(x), float(y)] for x, y in zip(xs.tolist(), ys.tolist())]
+                        masks.append(contour)
 
-        image_tensor = self._to_tensor(arr).to(self.device)
-        image_tensor = image_tensor.unsqueeze(0)
+            result = {"path": meta.get("path"), "boxes": boxes, "masks": masks}
+            stem = Path(meta.get("path", f"sample_{sample_idx}"))
+            out_file = args.output / f"{stem.stem}.json"
+            with out_file.open("w", encoding="utf-8") as handle:
+                json.dump(result, handle, ensure_ascii=False, indent=2)
 
-        ctx_vec = torch.from_numpy(self._load_context(paths["meta"])).to(self.device)
-        ctx_vec = ctx_vec.unsqueeze(0)
 
-        ctx_input = ctx_vec
-        if self.projector is not None:
-            ctx_input = self.projector(ctx_vec)
-
-        outputs = self.model(image_tensor, ctx_input)
-        logits = outputs.get("logits")
-        if logits is None:
-            raise RuntimeError("Model output does not contain 'logits'.")
-
-        probs = torch.sigmoid(logits)
-        resized = F.interpolate(
-            probs,
-            size=(orig_h, orig_w),
-            mode="bilinear",
-            align_corners=False,
-        )
-
-        result_masks: List[np.ndarray] = []
-        result_boxes: List[List[float]] = []
-        result_classes: List[int] = []
-        result_scores: List[float] = []
-
-        threshold = float(self.cfg.mask_threshold)
-        score_thr = float(self.cfg.score_threshold)
-
-        for cls_idx in range(resized.shape[1]):
-            cls_mask = resized[0, cls_idx]
-            score = float(cls_mask.max().item())
-            if score < score_thr:
-                continue
-
-            binary = (cls_mask >= threshold).float()
-            if binary.sum() <= 0:
-                continue
-
-            mask_np = binary.cpu().numpy()
-            ys, xs = np.where(mask_np > 0.0)
-            if xs.size == 0 or ys.size == 0:
-                continue
-
-            x0, x1 = float(xs.min()), float(xs.max())
-            y0, y1 = float(ys.min()), float(ys.max())
-            result_masks.append(mask_np)
-            result_boxes.append([x0, y0, x1, y1])
-            result_classes.append(cls_idx)
-            result_scores.append(score)
-
-        return {
-            "name": name,
-            "boxes": result_boxes,
-            "masks": result_masks,
-            "classes": result_classes,
-            "scores": result_scores,
-            "logits": logits.detach().cpu(),
-            "context": ctx_vec.detach().cpu(),
-        }
+if __name__ == "__main__":
+    run_inference()

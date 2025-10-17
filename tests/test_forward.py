@@ -4,7 +4,8 @@ import os
 from pathlib import Path
 
 import pytest
-import torch
+
+torch = pytest.importorskip("torch")
 
 from src.model.build import build_yolo11_multi
 
@@ -16,6 +17,7 @@ def test_model_forward_smoke() -> None:
         pytest.skip("YOLO_PRETRAINED environment variable must point to a valid checkpoint")
 
     cfg = {
+        "model": {"cfg": "src/model/yolo11m_multi.yaml"},
         "pretrained": weights_path,
         "context": {
             "text_dim": 256,
@@ -23,10 +25,11 @@ def test_model_forward_smoke() -> None:
                 "normal_x",
                 "normal_y",
                 "normal_z",
-                "rough",
+                "roughness",
+                "metallic",
                 "ao",
                 "height",
-                "metallic",
+                "curvature",
             ],
             "adapter_dim": 128,
             "hidden_dim": 128,
@@ -36,7 +39,7 @@ def test_model_forward_smoke() -> None:
     }
     model = build_yolo11_multi(cfg).eval()
     images = torch.rand(1, 3, 64, 64)
-    pbr = torch.rand(1, 7, 64, 64)
+    pbr = torch.rand(1, 8, 64, 64)
     text = torch.rand(1, 256)
     outputs = model(images, pbr=pbr, text=text)
     assert "pred" in outputs

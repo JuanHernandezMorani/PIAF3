@@ -124,14 +124,23 @@ def build_yolo11_multi(cfg: Mapping[str, Any]) -> YoloMultiModel:
         )
         raise ImportError(message) from exc
 
+    model_section = cfg.get("model", {})
+    model_yaml = model_section.get("cfg")
     pretrained = cfg.get("pretrained")
-    if not pretrained:
-        raise ValueError("cfg.pretrained must point to a YOLO checkpoint")
-    base_model = YOLO(pretrained).model
+
+    if model_yaml:
+        base = YOLO(model_yaml)
+        if pretrained:
+            base.load(pretrained)
+    elif pretrained:
+        base = YOLO(pretrained)
+    else:
+        raise ValueError("Either 'pretrained' or 'model.cfg' must be provided in the config")
+    base_model = base.model
 
     context_cfg = cfg.get("context", {})
     text_dim = int(context_cfg.get("text_dim", 0) or 0)
-    pbr_channels = context_cfg.get("pbr_channels", [])
+    pbr_channels = context_cfg.get("pbr_channels", []) or []
     pbr_dim = len(pbr_channels)
     adapter_dim = int(context_cfg.get("adapter_dim", 256))
     hidden_dim = int(context_cfg.get("hidden_dim", adapter_dim))
