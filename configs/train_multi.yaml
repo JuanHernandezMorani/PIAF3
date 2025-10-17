@@ -1,0 +1,77 @@
+data:
+  train: data/train.yaml
+  val: data/val.yaml
+  imgsz: 640
+  batch: 16
+  workers: 8
+  mosaic: true
+  mosaic_prob: 0.5
+  hsv_jitter: 0.05
+  block_mix_prob: 0.2
+
+context:
+  text_dim: 256
+  pbr_channels:
+    - normal_x
+    - normal_y
+    - normal_z
+    - rough
+    - ao
+    - height
+    - metallic
+  adapter_dim: 256
+  hidden_dim: 256
+  dropout: 0.0
+
+film:
+  targets:
+    - backbone.stage2.c3
+    - neck.p3.c3
+    - neck.p4.c3
+  hidden: 256
+  dropout: 0.05
+
+aux:
+  enable: true
+  out_scales:
+    - p3
+    - p4
+  use_ssim: false
+
+loss:
+  aux_lambda: 0.2
+  aux_warmup_iters: 1000
+  pbr_weights:
+    normal: 1.0
+    rough: 0.5
+    ao: 0.25
+    height: 0.25
+    metallic: 0.25
+  use_ssim: false
+
+train:
+  epochs: 50
+  freeze_epochs: 8
+  lr: 0.0002
+  weight_decay: 0.05
+  warmup_steps: 1000
+  ema: true
+  val_interval: 1
+  amp: true
+  grad_accum: 1
+  clip_grad: 0.0
+  use_text: true
+  use_pbr: true
+  val_conf: 0.25
+  val_iou: 0.7
+  val_max_det: 300
+  val_agnostic: false
+  ablations: {}
+
+save:
+  project: runs/multi
+  name: exp
+  keep_last: 5
+
+seed: 42
+deterministic: false

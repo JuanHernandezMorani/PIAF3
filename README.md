@@ -5,6 +5,56 @@ Este repositorio contiene un esqueleto para entrenar un modelo YOLOv11 multimoda
 procesamiento de los assets para garantizar su consistencia antes de
 entrenamiento.
 
+## Entrenamiento multimodal
+
+### Requisitos
+
+- Ubuntu 20.04 o superior.
+- NVIDIA CUDA 12.x (opcional pero recomendado para acelerar el entrenamiento).
+- Python 3.10+ con PyTorch y torchvision compatibles con la versión de CUDA instalada.
+
+Instala las dependencias necesarias mediante:
+
+```bash
+pip install -r requirements.txt
+```
+
+### Ejecución
+
+```bash
+python -m src.train \
+  --config configs/train_multi.yaml \
+  --pretrained yolo.pt \
+  --project runs/multi \
+  --name exp1
+```
+
+### Estructura del dataset
+
+```
+dataset/
+├── data.yaml          # describe `path`, `train` y `val`
+├── images/
+│   ├── train/
+│   │   └── *.png | *.jpg
+│   └── val/
+│       └── *.png | *.jpg
+├── labels/
+│   ├── train/
+│   │   └── *.txt
+│   └── val/
+│       └── *.txt
+├── texts/             # opcional, descripciones por asset
+│   └── *.txt
+└── PBR maps junto a cada imagen con sufijos:
+    *_normal.png, *_roughness.png, *_ao.png,
+    *_height.png, *_metallic.png
+```
+
+Los mapas PBR deben estar normalizados en el rango `[0, 1]`. Las normales en espacio tangente aceptan valores en `[-1, 1]`, pero el *loader* los remapeará automáticamente a `[0, 1]` si detecta valores fuera del rango esperado.
+
+Los textos pueden residir junto a la imagen (`image.png` + `image.txt`) o en `texts/` con el mismo nombre base.
+
 ## Validación de dataset (`tools/validate_dataset.py`)
 
 La validación inspecciona cada elemento del *split* y verifica:

@@ -1,16 +1,22 @@
 """Auxiliary heads for reconstructing PBR modalities."""
 from __future__ import annotations
 
-from typing import Dict, Iterable, Mapping, Optional, Tuple
+from typing import Dict, Mapping, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+PBR_CHANNEL_GROUPS: Dict[str, slice] = {
+    "normal": slice(0, 3),
+    "rough": slice(3, 4),
+    "ao": slice(4, 5),
+    "height": slice(5, 6),
+    "metallic": slice(6, 7),
+}
+
 
 def _make_head(in_ch: int, out_ch: int) -> nn.Sequential:
-    """Simple two-layer conv head used for auxiliary predictions."""
-
     return nn.Sequential(
         nn.Conv2d(in_ch, in_ch, kernel_size=3, padding=1, bias=False),
         nn.BatchNorm2d(in_ch),
@@ -19,128 +25,112 @@ def _make_head(in_ch: int, out_ch: int) -> nn.Sequential:
     )
 
 
-class AuxHeads(nn.Module):
-    """Configurable collection of auxiliary prediction heads.
+def _masked_l1(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    mask: Optional[torch.Tensor],
+    channel_slice: slice,
+) -> torch.Tensor:
+    pred_slice = pred[:, channel_slice, ...]
+    tgt_slice = target[:, channel_slice, ...]
+    if mask is not None:
+        mask_slice = mask[:, channel_slice, ...]
+        weight = mask_slice.sum()
+        if weight <= 0:
+            return pred_slice.new_zeros(())
+        return torch.sum(torch.abs(pred_slice - tgt_slice) * mask_slice) / weight.clamp_min(1e-6)
+    return torch.mean(torch.abs(pred_slice - tgt_slice))
 
-    The module exposes a unified interface that allows the caller to enable a
-    subset of heads (normals, roughness, specular and emissive). Each head can
-    compute its own loss term which is aggregated by :meth:`compute_loss` and
-    returned alongside a dictionary of logging values (useful for TensorBoard or
-    console logging).
-    """
 
-    _HEAD_CHANNELS: Mapping[str, int] = {
-        "normals": 3,
-        "rough": 1,
-        "spec": 1,
-        "emiss": 1,
-    }
+def _masked_ssim(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    mask: Optional[torch.Tensor],
+) -> torch.Tensor:
+    kernel_size = 3
+    padding = kernel_size // 2
+    mu_x = F.avg_pool2d(pred, kernel_size, stride=1, padding=padding)
+    mu_y = F.avg_pool2d(target, kernel_size, stride=1, padding=padding)
+    sigma_x = F.avg_pool2d(pred * pred, kernel_size, stride=1, padding=padding) - mu_x * mu_x
+    sigma_y = F.avg_pool2d(target * target, kernel_size, stride=1, padding=padding) - mu_y * mu_y
+    sigma_xy = F.avg_pool2d(pred * target, kernel_size, stride=1, padding=padding) - mu_x * mu_y
+    c1 = 0.01 ** 2
+    c2 = 0.03 ** 2
+    numerator = (2 * mu_x * mu_y + c1) * (2 * sigma_xy + c2)
+    denominator = (mu_x * mu_x + mu_y * mu_y + c1) * (sigma_x + sigma_y + c2)
+    ssim_map = torch.clamp(numerator / (denominator + 1e-6), 0.0, 1.0)
+    if mask is not None:
+        mask_pool = F.avg_pool2d(mask, kernel_size, stride=1, padding=padding)
+        weight = mask_pool.sum().clamp_min(1e-6)
+        return torch.sum(ssim_map * mask_pool) / weight
+    return ssim_map.mean()
+
+
+class PBRReconHeads(nn.Module):
+    """Auxiliary reconstruction heads for PBR channels."""
 
     def __init__(
         self,
-        in_channels: int,
+        channels: Mapping[str, int],
         *,
-        enabled: Optional[Iterable[str]] = None,
-        loss_weights: Optional[Mapping[str, float]] = None,
+        out_channels: int,
     ) -> None:
         super().__init__()
-        if in_channels <= 0:
-            raise ValueError("in_channels must be positive")
+        if not channels:
+            raise ValueError("channels mapping must not be empty")
+        self.heads = nn.ModuleDict({name: _make_head(in_ch, out_channels) for name, in_ch in channels.items()})
+        self.out_channels = out_channels
 
-        if enabled is None:
-            enabled = self._HEAD_CHANNELS.keys()
-
-        self.heads = nn.ModuleDict()
-        for name in enabled:
-            if name not in self._HEAD_CHANNELS:
-                raise ValueError(f"Unknown auxiliary head '{name}'")
-            out_ch = self._HEAD_CHANNELS[name]
-            self.heads[name] = _make_head(in_channels, out_ch)
-
-        self.loss_weights = {
-            head: float(loss_weights[head]) if loss_weights and head in loss_weights else 1.0
-            for head in self.heads.keys()
-        }
-
-        self.register_buffer("_zero", torch.tensor(0.0), persistent=False)
-
-    # ---------------------------------------------------------------------
-    # Properties
-    # ---------------------------------------------------------------------
-    @property
-    def enabled_heads(self) -> Tuple[str, ...]:
-        """Returns the tuple of enabled head names."""
-
-        return tuple(self.heads.keys())
-
-    # ------------------------------------------------------------------
-    # Forward / loss API
-    # ------------------------------------------------------------------
-    def forward(self, feat: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """Runs every enabled head over the provided feature map."""
-
+    def forward(self, features: Mapping[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         outputs: Dict[str, torch.Tensor] = {}
         for name, head in self.heads.items():
-            outputs[name] = head(feat)
+            if name in features:
+                outputs[name] = head(features[name])
         return outputs
 
     def compute_loss(
         self,
         preds: Mapping[str, torch.Tensor],
-        targets: Mapping[str, torch.Tensor],
+        target: torch.Tensor,
         *,
-        reduction: str = "mean",
+        mask: Optional[torch.Tensor] = None,
+        weights: Optional[Mapping[str, float]] = None,
+        use_ssim: bool = False,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        """Computes the aggregated auxiliary loss and logging scalars.
+        if not preds:
+            device = target.device
+            return torch.zeros((), device=device), {}
+        total_loss = target.new_tensor(0.0)
+        channel_totals: Dict[str, torch.Tensor] = {key: target.new_tensor(0.0) for key in PBR_CHANNEL_GROUPS}
+        logs: Dict[str, float] = {}
+        for name, pred in preds.items():
+            if target.shape[-2:] != pred.shape[-2:]:
+                resized_target = F.interpolate(target, size=pred.shape[-2:], mode="bilinear", align_corners=False)
+            else:
+                resized_target = target
+            if mask is not None and mask.shape[-2:] != pred.shape[-2:]:
+                resized_mask = F.interpolate(mask, size=pred.shape[-2:], mode="nearest")
+            else:
+                resized_mask = mask
+            head_loss = pred.new_tensor(0.0)
+            for channel_name, channel_slice in PBR_CHANNEL_GROUPS.items():
+                if channel_slice.stop > self.out_channels:
+                    continue
+                weight = float(weights.get(channel_name, 1.0)) if weights else 1.0
+                l1_value = _masked_l1(pred, resized_target, resized_mask, channel_slice)
+                channel_totals[channel_name] = channel_totals[channel_name] + l1_value
+                head_loss = head_loss + weight * l1_value
+            if use_ssim:
+                ssim_val = _masked_ssim(pred, resized_target, resized_mask)
+                head_loss = 0.8 * head_loss + 0.2 * (1.0 - ssim_val)
+                logs[f"aux/{name}_ssim"] = float(ssim_val.detach().cpu())
+            logs[f"aux/{name}_loss"] = float(head_loss.detach().cpu())
+            total_loss = total_loss + head_loss
+        total_loss = total_loss / len(preds)
+        for channel_name, value in channel_totals.items():
+            logs[f"aux/l1_{channel_name}"] = float((value / len(preds)).detach().cpu())
+        return total_loss, logs
 
-        Parameters
-        ----------
-        preds:
-            Dictionary with the predictions produced by :meth:`forward`.
-        targets:
-            Dictionary with reference tensors (same naming convention as
-            :attr:`enabled_heads`). Target tensors will be resized if needed so
-            they match the spatial dimensions of the predictions.
-        reduction:
-            Currently supports ``"mean"`` and ``"sum"``.
-        """
 
-        if reduction not in {"mean", "sum"}:
-            raise ValueError("reduction must be either 'mean' or 'sum'")
-
-        if not self.heads:
-            zero = self._zero.detach().clone()
-            return zero, {}
-
-        total_loss: Optional[torch.Tensor] = None
-        log_scalars: Dict[str, float] = {}
-
-        for name, head in self.heads.items():
-            if name not in preds or name not in targets:
-                continue
-
-            pred = preds[name]
-            target = targets[name]
-            if pred.shape != target.shape:
-                target = F.interpolate(
-                    target,
-                    size=pred.shape[-2:],
-                    mode="bilinear",
-                    align_corners=False,
-                )
-
-            loss_val = F.l1_loss(pred, target, reduction=reduction)
-            weighted = loss_val * self.loss_weights[name]
-            total_loss = weighted if total_loss is None else total_loss + weighted
-
-            log_scalars[f"aux/{name}"] = float(loss_val.detach().cpu())
-
-        if total_loss is None:
-            total_loss = self._zero.detach().clone()
-        log_scalars["aux/total"] = float(total_loss.detach().cpu())
-        return total_loss, log_scalars
-
-    def extra_repr(self) -> str:
-        heads = ", ".join(self.enabled_heads) or "none"
-        return f"heads=[{heads}]"
+__all__ = ["PBRReconHeads", "PBR_CHANNEL_GROUPS"]
 

@@ -1,14 +1,16 @@
-"""Model utilities and building blocks for the multimodal YOLO skeleton."""
+"""Model utilities and building blocks for the multimodal YOLO pipeline."""
 from .film import FiLM
-from .backbone import ConditionedBackbone
-from .neck import ConditionedNeck
-from .model import MultimodalYoloStub
-from .aux_heads import AuxHeads
+from .context_adapter import ContextAdapter
+from .integrations import FiLMBlock, inject_film
+from .aux_heads import PBRReconHeads
+from .build import YoloMultiModel, build_yolo11_multi
 
 __all__ = [
     "FiLM",
-    "ConditionedBackbone",
-    "ConditionedNeck",
-    "MultimodalYoloStub",
-    "AuxHeads",
+    "ContextAdapter",
+    "FiLMBlock",
+    "inject_film",
+    "PBRReconHeads",
+    "YoloMultiModel",
+    "build_yolo11_multi",
 ]
