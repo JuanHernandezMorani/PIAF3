@@ -22,10 +22,24 @@ def parse_args():
 
 def main():
     args = parse_args()
-    train_ds = MultimodalYoloDataset(args.root, args.split_train, imgsz=args.imgsz,
-                                     use_metalness=args.use_metalness, use_coordconv=args.use_coordconv)
-    val_ds   = MultimodalYoloDataset(args.root, args.split_val, imgsz=args.imgsz,
-                                     use_metalness=args.use_metalness, use_coordconv=args.use_coordconv)
+    train_ds = MultimodalYoloDataset(
+        args.root,
+        args.split_train,
+        imgsz=args.imgsz,
+        use_metalness=args.use_metalness,
+        use_coordconv=args.use_coordconv,
+        augment=True,
+        pbr_dropout_prob=0.2,
+    )
+    val_ds = MultimodalYoloDataset(
+        args.root,
+        args.split_val,
+        imgsz=args.imgsz,
+        use_metalness=args.use_metalness,
+        use_coordconv=args.use_coordconv,
+        augment=False,
+        pbr_dropout_prob=0.0,
+    )
 
     train_dl = DataLoader(train_ds, batch_size=args.batch, shuffle=True, num_workers=2, collate_fn=collate_fn)
     val_dl   = DataLoader(val_ds, batch_size=args.batch, shuffle=False, num_workers=2, collate_fn=collate_fn)

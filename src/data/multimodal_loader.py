@@ -36,6 +36,7 @@ class MultimodalYoloDataset(Dataset):
         use_coordconv: bool = False,
         augment: bool = True,
         seed: Optional[int] = None,
+        pbr_dropout_prob: float = 0.0,
     ):
         self.root = root
         self.imgsz = imgsz
@@ -43,6 +44,7 @@ class MultimodalYoloDataset(Dataset):
         self.use_coordconv = use_coordconv
         self.augment = augment
         self.rng = random.Random(seed) if seed is not None else random.Random()
+        self.pbr_dropout_prob = float(max(0.0, pbr_dropout_prob))
 
         with open(split_file, "r", encoding="utf-8") as f:
             lines = [l.strip() for l in f.readlines() if l.strip() and not l.startswith("#")]
@@ -159,6 +161,45 @@ class MultimodalYoloDataset(Dataset):
 
         return arr, polys
 
+    def _apply_pbr_dropout(self, arr: np.ndarray) -> np.ndarray:
+        if self.pbr_dropout_prob <= 0.0:
+            return arr
+
+        dropped = arr.copy()
+        slices = {
+            "normals": slice(3, 6),
+            "rough": slice(6, 7),
+            "spec": slice(7, 8),
+            "emiss": slice(8, 9),
+        }
+
+        for key, slc in slices.items():
+            if slc.stop > dropped.shape[-1]:
+                continue
+            if self.rng.random() < self.pbr_dropout_prob:
+                dropped[..., slc] = 0.0
+
+        return dropped
+
+    def _extract_pbr_targets(self, arr: np.ndarray) -> Dict[str, np.ndarray]:
+        slices = {
+            "normals": slice(3, 6),
+            "rough": slice(6, 7),
+            "spec": slice(7, 8),
+            "emiss": slice(8, 9),
+        }
+
+        targets: Dict[str, np.ndarray] = {}
+        for key, slc in slices.items():
+            if slc.stop <= arr.shape[-1]:
+                targets[key] = arr[..., slc].copy()
+
+        return targets
+
+    def _to_chw_tensor(self, np_arr: np.ndarray) -> torch.Tensor:
+        tensor = torch.from_numpy(np_arr.transpose(2, 0, 1)).float()
+        return self._resize(tensor)
+
     def _resize(self, tensor: torch.Tensor) -> torch.Tensor:
         tensor = tensor.unsqueeze(0)
         resized = F.interpolate(tensor, size=(self.imgsz, self.imgsz), mode="bilinear", align_corners=False)
@@ -173,8 +214,15 @@ class MultimodalYoloDataset(Dataset):
         polys_px, classes = self._load_polygons(paths["ann"], width, height)
         x_np, polys_px = self._apply_augmentations(x_np, polys_px)
 
-        x_tensor = torch.from_numpy(x_np.transpose(2, 0, 1)).float()
-        x_tensor = self._resize(x_tensor)
+        pbr_targets_np = self._extract_pbr_targets(x_np)
+
+        x_np = self._apply_pbr_dropout(x_np)
+
+        x_tensor = self._to_chw_tensor(x_np)
+
+        pbr_targets = {
+            key: self._to_chw_tensor(value) for key, value in pbr_targets_np.items()
+        }
 
         scale_x = self.imgsz / float(width)
         scale_y = self.imgsz / float(height)
@@ -194,6 +242,7 @@ class MultimodalYoloDataset(Dataset):
             "segments": scaled_polys,
             "orig_size": torch.tensor([height, width], dtype=torch.float32),
             "img_size": torch.tensor([self.imgsz, self.imgsz], dtype=torch.float32),
+            "pbr": pbr_targets,
         }
 
         return x_tensor, ctx, targets
